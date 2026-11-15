@@ -10,12 +10,13 @@ permissions:
   contents: read
 
 # Configuração (Settings > Secrets and variables > Actions):
-#   variables: DOCKERHUB_USERNAME, EKS_CLUSTER (ex.: eks-store), AWS_REGION (padrão us-east-2)
-#   secrets:   DOCKERHUB_TOKEN, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN (opcional)
+#   Amazon ECR: variable AWS_ECR=true + secret AWS_ROLE_ARN (OIDC, sem chave fixa; ou as access keys)
+#   Docker Hub: variable DOCKERHUB_USERNAME + secret DOCKERHUB_TOKEN
+#   Deploy:     variable EKS_CLUSTER (ex.: eks-store); AWS_REGION opcional (padrão us-east-2)
 # Sem as variáveis, só o job de build/teste roda; os outros ficam "skipped".
 env:
   SERVICE: gateway
-  IMAGE: ${{ vars.DOCKERHUB_USERNAME }}/gateway-service
+  REPOSITORY: gateway-service
 
 jobs:
   build:
@@ -36,10 +37,13 @@ jobs:
           path: target/*.jar
 
   image:
-    name: Docker Hub (build, push, scan)
+    name: Imagem (ECR ou Docker Hub, scan)
     needs: build
-    if: github.event_name != 'pull_request' && vars.DOCKERHUB_USERNAME != ''
+    if: github.event_name != 'pull_request' && (vars.AWS_ECR == 'true' || vars.DOCKERHUB_USERNAME != '')
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # OIDC com a AWS
     steps:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
@@ -48,10 +52,28 @@ jobs:
           path: target
       - uses: docker/setup-qemu-action@v4
       - uses: docker/setup-buildx-action@v4
-      - uses: docker/login-action@v4
+      - if: vars.AWS_ECR == 'true'
+        uses: aws-actions/configure-aws-credentials@v6
         with:
-          username: ${{ vars.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-2' }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          mask-aws-account-id: true # o log de repositório público não mostra a conta
+      - name: Login no registry
+        env:
+          ECR: ${{ vars.AWS_ECR }}
+          HUB_USER: ${{ vars.DOCKERHUB_USERNAME }}
+          HUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [ "$ECR" = true ]; then
+            REGISTRY=$(aws sts get-caller-identity --query Account --output text).dkr.ecr.$AWS_REGION.amazonaws.com
+            aws ecr get-login-password | docker login -u AWS --password-stdin "$REGISTRY"
+          else
+            REGISTRY=$HUB_USER
+            echo "$HUB_TOKEN" | docker login -u "$HUB_USER" --password-stdin
+          fi
+          echo "IMAGE=$REGISTRY/$REPOSITORY" >> "$GITHUB_ENV"
       - name: Build & push (linux/amd64 para o EKS, linux/arm64 para Mac/Graviton)
         uses: docker/build-push-action@v7
         with:
@@ -71,15 +93,23 @@ jobs:
     needs: image
     if: github.ref == 'refs/heads/main' && vars.EKS_CLUSTER != ''
     runs-on: ubuntu-latest
-    env:
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
-      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-2' }}
+    permissions:
+      contents: read
+      id-token: write
     steps:
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-region: ${{ vars.AWS_REGION || 'us-east-2' }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          mask-aws-account-id: true
       - name: Rolling update
+        env:
+          ECR: ${{ vars.AWS_ECR }}
+          REGISTRY: ${{ vars.DOCKERHUB_USERNAME }}
         run: |
-          [ -n "$AWS_SESSION_TOKEN" ] || unset AWS_SESSION_TOKEN
+          [ "$ECR" != true ] || REGISTRY=$(aws sts get-caller-identity --query Account --output text).dkr.ecr.$AWS_REGION.amazonaws.com
           aws eks update-kubeconfig --name ${{ vars.EKS_CLUSTER }}
-          kubectl set image "deployment/$SERVICE" "$SERVICE=$IMAGE:${{ github.sha }}"
+          kubectl set image "deployment/$SERVICE" "$SERVICE=$REGISTRY/$REPOSITORY:${{ github.sha }}"
           kubectl rollout status "deployment/$SERVICE" --timeout=300s
